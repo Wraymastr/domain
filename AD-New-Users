@@ -1,0 +1,314 @@
+<#
+================================================================================
+ New-ADUsers.ps1
+
+ PURPOSE:
+   Bulk-create Active Directory user accounts from a CSV file.
+   Designed to be reused any time you need to onboard a batch of users -
+   you edit the CSV and the CONFIG section below, not the logic of the
+   script itself.
+
+ REQUIREMENTS:
+   - Run on a machine with the ActiveDirectory PowerShell module
+     (RSAT tools, or run directly on a Domain Controller)
+   - Run PowerShell "as Administrator" with an account that has rights
+     to create users in the target OU
+   - A CSV file with your user data (see CSV FORMAT below)
+
+ CSV FORMAT (header row required, column order doesn't matter):
+   FirstName,LastName,Username,Group,UserID,Password
+   Jane,Doe,jdoe25,Grade5,100234,
+   John,Smith,jsmith25,Grade5,100235,
+
+   - Username : the sAMAccountName / login name you want them to have
+   - Password : leave BLANK to auto-generate one (recommended), or
+                put a specific password in the CSV to force it
+   - Group / UserID are optional but useful for OU sorting or attributes
+     (e.g. grade level, department, employee/student ID, etc.)
+
+ WHAT THIS SCRIPT DOES:
+   1. Reads the CSV
+   2. For each row, builds the account (name, UPN, password, OU, group)
+   3. Skips any username that already exists (won't duplicate/error out)
+   4. Forces a password change at next logon (unless you turn that off below)
+   5. Adds each new user to an AD group (e.g. "Users-2025") if configured
+   6. Writes a log CSV of what happened (created / skipped / failed) next
+      to this script, and a separate CSV of generated passwords so you
+      can hand them out
+
+ HOW TO USE:
+   1. Edit the CONFIG SECTION below (domain info, OU, defaults)
+   2. Save your user list as "users.csv" on your Desktop
+      (or anywhere, and pass -CsvPath "C:\Path\To\users.csv")
+   3. Run:  .\New-ADUsers.ps1
+      (or:  .\New-ADUsers.ps1 -CsvPath "C:\Path\To\users.csv")
+   4. Review the log + generated-passwords file it creates
+================================================================================
+#>
+
+[CmdletBinding()]
+param(
+    # Path to the CSV of users to import. Can also just be edited below
+    # as a default so you can double-click / run with no arguments.
+    # Defaults to "users.csv" on the current user's Desktop - just drop
+    # your CSV there each time and run the script with no arguments.
+    [string]$CsvPath = (Join-Path ([Environment]::GetFolderPath("Desktop")) "users.csv")
+)
+
+# Requires the AD module - fail fast with a clear message if it's missing
+Import-Module ActiveDirectory -ErrorAction Stop
+
+
+# ================================================================================
+# 1) CONFIG SECTION - EDIT THIS EVERY TIME YOU REUSE THE SCRIPT FOR A NEW BATCH
+# ================================================================================
+
+# --- Where new accounts get created ---
+# Full Distinguished Name of the OU users should land in.
+# Tip: Right-click the OU in ADUC > Properties > Attribute Editor > distinguishedName to copy it exactly.
+$TargetOU = "OU=Users,OU=2025-2026,DC=yourdistrict,DC=k12,DC=state,DC=us"
+
+# --- Domain / UPN suffix ---
+# The part after the @ in their login email / UPN, e.g. user@yourdistrict.k12.state.us
+$UPNSuffix = "yourdistrict.k12.state.us"
+
+# --- Group to add every new user to (leave as $null to skip) ---
+# Example: "Users-2025-2026" or "Grade5-Users" or "Staff-Users"
+$GroupToAddTo = "Users-2025-2026"
+
+# --- Password behavior ---
+# If the CSV's Password column is blank, a random password is generated.
+# Set to $true to force a password change at first logon (recommended).
+$ForcePasswordChangeAtLogon = $true
+
+# If you want every auto-generated password to follow a simple, predictable
+# pattern instead of fully random (some districts prefer this for younger
+# students / shared-device users), set $UseSimplePasswordPattern = $true
+# and edit the pattern.
+# Pattern uses: {First} {Last} {UserID} {Group} as available tokens.
+$UseSimplePasswordPattern = $false
+$SimplePasswordPattern    = '{First}{UserID}!'   # e.g. Jane100234!
+
+# --- Account defaults applied to every user ---
+$AccountEnabled      = $true
+$Department          = "Users"             # optional, shows in AD attributes
+$Company             = "Your School District"
+$HomeDrive           = $null               # e.g. "H:" or $null to skip
+$HomeDirectoryFormat = $null                # e.g. "\\fileserver\users\%username%" or $null to skip
+
+# --- Output files (created next to this script, timestamped) ---
+$Timestamp        = Get-Date -Format "yyyy-MM-dd_HHmmss"
+$ScriptFolder     = Split-Path -Parent $MyInvocation.MyCommand.Path
+$LogPath          = Join-Path $ScriptFolder "ADImportLog_$Timestamp.csv"
+$PasswordsOutPath = Join-Path $ScriptFolder "GeneratedPasswords_$Timestamp.csv"
+
+
+# ================================================================================
+# 2) HELPER FUNCTIONS - no need to edit below this line for normal use
+# ================================================================================
+
+function New-RandomPassword {
+    <#
+        Generates a random password that satisfies typical AD complexity rules:
+        upper, lower, number, symbol, minimum length 12.
+    #>
+    param([int]$Length = 12)
+
+    $upper   = 'ABCDEFGHJKLMNPQRSTUVWXYZ'   # no I/O to avoid confusion
+    $lower   = 'abcdefghijkmnopqrstuvwxyz'  # no l
+    $numbers = '23456789'                   # no 0/1
+    $symbols = '!@#$%'
+
+    $all = $upper + $lower + $numbers + $symbols
+    $rand = [System.Random]::new()
+
+    # guarantee at least one of each category
+    $passwordChars = @(
+        $upper[$rand.Next(0, $upper.Length)]
+        $lower[$rand.Next(0, $lower.Length)]
+        $numbers[$rand.Next(0, $numbers.Length)]
+        $symbols[$rand.Next(0, $symbols.Length)]
+    )
+
+    while ($passwordChars.Count -lt $Length) {
+        $passwordChars += $all[$rand.Next(0, $all.Length)]
+    }
+
+    # shuffle
+    $shuffled = $passwordChars | Sort-Object { $rand.Next() }
+    return -join $shuffled
+}
+
+function New-PatternPassword {
+    param($Row)
+
+    $pw = $SimplePasswordPattern
+    $pw = $pw -replace '\{First\}',  $Row.FirstName
+    $pw = $pw -replace '\{Last\}',   $Row.LastName
+    $pw = $pw -replace '\{UserID\}', $Row.UserID
+    $pw = $pw -replace '\{Group\}',  $Row.Group
+    return $pw
+}
+
+
+# ================================================================================
+# 3) MAIN SCRIPT - no need to edit below this line for normal use
+# ================================================================================
+
+if (-not (Test-Path $CsvPath)) {
+    Write-Error "CSV file not found at: $CsvPath  -- update -CsvPath or the default in the param() block."
+    return
+}
+
+$users = Import-Csv -Path $CsvPath
+
+if (-not $users -or $users.Count -eq 0) {
+    Write-Error "CSV loaded but contained no rows: $CsvPath"
+    return
+}
+
+Write-Host "Loaded $($users.Count) user record(s) from $CsvPath" -ForegroundColor Cyan
+
+# Verify target OU exists before we start
+try {
+    Get-ADOrganizationalUnit -Identity $TargetOU -ErrorAction Stop | Out-Null
+}
+catch {
+    Write-Error "Target OU not found or inaccessible: $TargetOU`nCheck the distinguishedName in the CONFIG SECTION."
+    return
+}
+
+# Verify group exists (if one is configured)
+if ($GroupToAddTo) {
+    try {
+        Get-ADGroup -Identity $GroupToAddTo -ErrorAction Stop | Out-Null
+    }
+    catch {
+        Write-Error "Group '$GroupToAddTo' not found. Fix `$GroupToAddTo in the CONFIG SECTION, or set it to `$null to skip group assignment."
+        return
+    }
+}
+
+$results          = New-Object System.Collections.Generic.List[Object]
+$generatedPwds    = New-Object System.Collections.Generic.List[Object]
+$createdCount     = 0
+$skippedCount     = 0
+$failedCount      = 0
+
+foreach ($row in $users) {
+
+    $firstName = $row.FirstName.Trim()
+    $lastName  = $row.LastName.Trim()
+    $username  = $row.Username.Trim()
+
+    # --- Basic validation per row ---
+    if ([string]::IsNullOrWhiteSpace($firstName) -or
+        [string]::IsNullOrWhiteSpace($lastName)  -or
+        [string]::IsNullOrWhiteSpace($username)) {
+
+        Write-Warning "Skipping row - missing FirstName/LastName/Username: $($row | Out-String)"
+        $results.Add([PSCustomObject]@{
+            Username = $username
+            Status   = "Failed"
+            Reason   = "Missing required field(s)"
+        })
+        $failedCount++
+        continue
+    }
+
+    # --- Skip if the account already exists ---
+    $existing = Get-ADUser -Filter "SamAccountName -eq '$username'" -ErrorAction SilentlyContinue
+    if ($existing) {
+        Write-Host "SKIP: $username already exists" -ForegroundColor Yellow
+        $results.Add([PSCustomObject]@{
+            Username = $username
+            Status   = "Skipped"
+            Reason   = "Account already exists"
+        })
+        $skippedCount++
+        continue
+    }
+
+    # --- Determine password ---
+    if (-not [string]::IsNullOrWhiteSpace($row.Password)) {
+        $plainPassword = $row.Password.Trim()          # explicit password from CSV
+    }
+    elseif ($UseSimplePasswordPattern) {
+        $plainPassword = New-PatternPassword -Row $row  # pattern-based
+    }
+    else {
+        $plainPassword = New-RandomPassword              # fully random
+    }
+    $securePassword = ConvertTo-SecureString $plainPassword -AsPlainText -Force
+
+    # --- Build display/UPN values ---
+    $displayName = "$firstName $lastName"
+    $upn         = "$username@$UPNSuffix"
+
+    # --- Build optional attribute hash so we don't pass empty/$null values ---
+    $newUserParams = @{
+        SamAccountName        = $username
+        UserPrincipalName     = $upn
+        Name                  = $displayName
+        GivenName             = $firstName
+        Surname               = $lastName
+        DisplayName           = $displayName
+        Path                  = $TargetOU
+        AccountPassword       = $securePassword
+        Enabled               = $AccountEnabled
+        ChangePasswordAtLogon = $ForcePasswordChangeAtLogon
+        Department            = $Department
+        Company               = $Company
+    }
+
+    if ($row.Group)  { $newUserParams["Description"] = "$($row.Group)" }
+    if ($row.UserID) { $newUserParams["EmployeeID"]  = $row.UserID }
+    if ($HomeDrive)   { $newUserParams["HomeDrive"] = $HomeDrive }
+    if ($HomeDirectoryFormat) {
+        $newUserParams["HomeDirectory"] = $HomeDirectoryFormat -replace '%username%', $username
+    }
+
+    # --- Create the account ---
+    try {
+        New-ADUser @newUserParams -ErrorAction Stop
+        Write-Host "CREATED: $username ($displayName)" -ForegroundColor Green
+
+        # --- Add to group ---
+        if ($GroupToAddTo) {
+            Add-ADGroupMember -Identity $GroupToAddTo -Members $username -ErrorAction Stop
+        }
+
+        $results.Add([PSCustomObject]@{
+            Username = $username
+            Status   = "Created"
+            Reason   = ""
+        })
+        $generatedPwds.Add([PSCustomObject]@{
+            Username  = $username
+            FullName  = $displayName
+            Password  = $plainPassword
+        })
+        $createdCount++
+    }
+    catch {
+        Write-Warning "FAILED to create $username : $($_.Exception.Message)"
+        $results.Add([PSCustomObject]@{
+            Username = $username
+            Status   = "Failed"
+            Reason   = $_.Exception.Message
+        })
+        $failedCount++
+    }
+}
+
+# --- Write logs ---
+$results       | Export-Csv -Path $LogPath -NoTypeInformation
+$generatedPwds | Export-Csv -Path $PasswordsOutPath -NoTypeInformation
+
+Write-Host ""
+Write-Host "=========================================" -ForegroundColor Cyan
+Write-Host " Done. Created: $createdCount  Skipped: $skippedCount  Failed: $failedCount" -ForegroundColor Cyan
+Write-Host " Full log:            $LogPath"
+Write-Host " Generated passwords: $PasswordsOutPath"
+Write-Host " (Treat the password file as sensitive - delete/secure it after distributing credentials)" -ForegroundColor Yellow
+Write-Host "=========================================" -ForegroundColor Cyan
