@@ -9,6 +9,11 @@ Connects to a Microsoft Entra tenant with Microsoft Graph, displays the tenant
 identity and last directory-sync state, counts objects still marked as synced,
 and writes a JSON audit record.
 
+Device-code authentication is used by default because recent Microsoft Graph
+modules route ordinary Windows sign-in through Web Account Manager (WAM), which
+can select the wrong account provider during customer-tenant administration.
+If a suitable Graph session already exists, the script reuses it by default.
+
 The script is audit-only unless -DisableSync is supplied. Disabling sync is a
 tenant-wide change that converts formerly synced users and groups to cloud-
 managed objects. It does not delete those objects.
@@ -29,6 +34,19 @@ with -DisableSync, except during a -WhatIf run.
 .PARAMETER TenantId
 Optional tenant GUID or verified domain to pass to Connect-MgGraph. Use this
 when you want to force authentication into a specific customer tenant.
+
+.PARAMETER AuthenticationMode
+Authentication flow used when a new Graph connection is required. DeviceCode
+is the default and avoids the Windows WAM popup. Interactive uses the ordinary
+Graph interactive/WAM flow.
+
+.PARAMETER LoginHint
+Optional work-account UPN supplied to Connect-MgGraph when the installed Graph
+module supports LoginHint. This is mainly useful with Interactive mode.
+
+.PARAMETER ForceNewConnection
+Ignores any suitable existing Graph context and starts a new authentication
+flow. By default, a valid existing context with the required scopes is reused.
 
 .PARAMETER ConfirmationTenantId
 Optional non-interactive safety confirmation. It must exactly match the tenant
@@ -56,17 +74,24 @@ Directory for JSON audit records. Defaults to EntraSyncCleanupLogs beside this
 script.
 
 .PARAMETER KeepConnection
-Leaves the Microsoft Graph session connected when the script finishes.
+Leaves a Microsoft Graph session opened by this script connected when it
+finishes. A pre-existing reused session is always left connected.
 
 .EXAMPLE
 PS> .\Disable-StaleEntraDirectorySync.ps1 -InstallGraphModule
 
-Audits whichever tenant you select at sign-in. No tenant settings are changed.
+Audits whichever tenant you select using device-code sign-in. No tenant
+settings are changed.
 
 .EXAMPLE
 PS> .\Disable-StaleEntraDirectorySync.ps1 -TenantId contoso.onmicrosoft.com
 
-Audits a specifically selected tenant.
+Audits a specifically selected tenant using device-code sign-in.
+
+.EXAMPLE
+PS> .\Disable-StaleEntraDirectorySync.ps1 -TenantId contoso.onmicrosoft.com -AuthenticationMode Interactive
+
+Uses the Windows interactive/WAM flow instead of the default device-code flow.
 
 .EXAMPLE
 PS> .\Disable-StaleEntraDirectorySync.ps1 -DisableSync -IHaveVerifiedNoSyncAgents
@@ -97,6 +122,13 @@ param(
     [switch]$IHaveVerifiedNoSyncAgents,
 
     [string]$TenantId,
+
+    [ValidateSet('DeviceCode', 'Interactive')]
+    [string]$AuthenticationMode = 'DeviceCode',
+
+    [string]$LoginHint,
+
+    [switch]$ForceNewConnection,
 
     [string]$ConfirmationTenantId,
 
@@ -237,6 +269,49 @@ function Get-DefaultVerifiedDomain {
     return '(no verified domain returned)'
 }
 
+function Test-GraphContextHasRequiredScopes {
+    param(
+        [Parameter(Mandatory)]$Context,
+        [Parameter(Mandatory)][string[]]$RequiredScopes
+    )
+
+    if ($null -eq $Context -or [string]::IsNullOrWhiteSpace([string]$Context.Account)) {
+        return $false
+    }
+
+    $contextScopes = @($Context.Scopes)
+    foreach ($requiredScope in $RequiredScopes) {
+        if (-not ($contextScopes -contains $requiredScope)) {
+            return $false
+        }
+    }
+
+    return $true
+}
+
+function Test-TenantSelectorMatchesOrganization {
+    param(
+        [string]$Selector,
+        [Parameter(Mandatory)]$Organization
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Selector)) {
+        return $true
+    }
+
+    if ($Selector.Trim() -eq [string]$Organization.id) {
+        return $true
+    }
+
+    foreach ($verifiedDomain in @($Organization.verifiedDomains)) {
+        if ($Selector.Trim() -eq [string]$verifiedDomain.name) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
 function Save-AuditRecord {
     param(
         [Parameter(Mandatory)]$Record,
@@ -268,6 +343,7 @@ if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
 }
 
 $connectedByScript = $false
+$reusedExistingConnection = $false
 $auditRecord = $null
 $auditPath = $null
 $defaultDomain = 'unknown-tenant'
@@ -277,25 +353,77 @@ try {
 
     Write-Section 'Microsoft Entra connection'
 
-    $connectParameters = @{
-        Scopes       = @('Organization.ReadWrite.All', 'Directory.ReadWrite.All')
-        ContextScope = 'Process'
-        ErrorAction  = 'Stop'
+    $requiredScopes = @('Organization.ReadWrite.All', 'Directory.ReadWrite.All')
+    $context = $null
+    $organization = $null
+
+    if (-not $ForceNewConnection) {
+        $candidateContext = Get-MgContext -ErrorAction SilentlyContinue
+
+        if ($null -ne $candidateContext -and (Test-GraphContextHasRequiredScopes -Context $candidateContext -RequiredScopes $requiredScopes)) {
+            try {
+                $candidateOrganization = Get-DirectoryOrganization
+
+                if (Test-TenantSelectorMatchesOrganization -Selector $TenantId -Organization $candidateOrganization) {
+                    $context = $candidateContext
+                    $organization = $candidateOrganization
+                    $reusedExistingConnection = $true
+                    Write-Host ("Reusing existing Graph session for {0}." -f $candidateContext.Account) -ForegroundColor Green
+                }
+                else {
+                    Write-Host 'The existing Graph session is for a different tenant; starting a new connection.' -ForegroundColor Yellow
+                }
+            }
+            catch {
+                Write-Host 'The existing Graph session could not be validated; starting a new connection.' -ForegroundColor Yellow
+            }
+        }
     }
 
-    if ((Get-Command Connect-MgGraph).Parameters.ContainsKey('NoWelcome')) {
-        $connectParameters.NoWelcome = $true
+    if (-not $reusedExistingConnection) {
+        $connectCommand = Get-Command Connect-MgGraph
+        $connectParameters = @{
+            Scopes       = $requiredScopes
+            ContextScope = 'Process'
+            ErrorAction  = 'Stop'
+        }
+
+        if ($connectCommand.Parameters.ContainsKey('NoWelcome')) {
+            $connectParameters.NoWelcome = $true
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($TenantId)) {
+            $connectParameters.TenantId = $TenantId
+        }
+
+        if ($AuthenticationMode -eq 'DeviceCode') {
+            if ($connectCommand.Parameters.ContainsKey('UseDeviceCode')) {
+                $connectParameters.UseDeviceCode = $true
+            }
+            elseif ($connectCommand.Parameters.ContainsKey('UseDeviceAuthentication')) {
+                $connectParameters.UseDeviceAuthentication = $true
+            }
+            else {
+                throw 'This Microsoft.Graph.Authentication version does not expose device-code authentication. Update the module and try again.'
+            }
+
+            Write-Host 'Starting device-code sign-in to avoid the Windows WAM account picker...' -ForegroundColor Cyan
+        }
+        else {
+            if (-not [string]::IsNullOrWhiteSpace($LoginHint) -and $connectCommand.Parameters.ContainsKey('LoginHint')) {
+                $connectParameters.LoginHint = $LoginHint
+            }
+
+            Write-Host 'Starting interactive/WAM sign-in...' -ForegroundColor Cyan
+        }
+
+        Connect-MgGraph @connectParameters | Out-Null
+        $connectedByScript = $true
+
+        $context = Get-MgContext
+        $organization = Get-DirectoryOrganization
     }
 
-    if (-not [string]::IsNullOrWhiteSpace($TenantId)) {
-        $connectParameters.TenantId = $TenantId
-    }
-
-    Connect-MgGraph @connectParameters | Out-Null
-    $connectedByScript = $true
-
-    $context = Get-MgContext
-    $organization = Get-DirectoryOrganization
     $defaultDomain = Get-DefaultVerifiedDomain -Organization $organization
 
     $syncEnabled = $organization.onPremisesSyncEnabled -eq $true
@@ -345,6 +473,8 @@ try {
         DefaultDomain           = $defaultDomain
         TenantId                = [string]$organization.id
         SignedInAccount         = [string]$context.Account
+        AuthenticationMode      = if ($reusedExistingConnection) { 'Existing Graph session' } else { $AuthenticationMode }
+        ReusedExistingConnection = $reusedExistingConnection
         DirectorySyncEnabledBefore = $syncEnabled
         LastDirectorySyncUtc    = if ($lastSyncUtc) { $lastSyncUtc.ToString('o') } else { $null }
         DaysSinceLastSync       = $daysSinceLastSync
@@ -449,6 +579,7 @@ try {
         Tenant                 = $organization.displayName
         DefaultDomain         = $defaultDomain
         TenantId               = $organization.id
+        Authentication         = if ($reusedExistingConnection) { 'Existing Graph session' } else { $AuthenticationMode }
         SyncEnabledBefore      = $syncEnabled
         LastSyncUtc            = $lastSyncUtc
         DaysSinceLastSync      = $daysSinceLastSync
