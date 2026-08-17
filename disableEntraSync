@@ -1,0 +1,483 @@
+#requires -Version 5.1
+
+<#
+.SYNOPSIS
+Audits and optionally disables stale tenant-wide Microsoft Entra directory sync.
+
+.DESCRIPTION
+Connects to a Microsoft Entra tenant with Microsoft Graph, displays the tenant
+identity and last directory-sync state, counts objects still marked as synced,
+and writes a JSON audit record.
+
+The script is audit-only unless -DisableSync is supplied. Disabling sync is a
+tenant-wide change that converts formerly synced users and groups to cloud-
+managed objects. It does not delete those objects.
+
+Before disabling, you must separately verify in the Entra admin center that no
+Microsoft Entra Connect Sync server or Cloud Sync agent is still active. The
+script cannot prove that solely from the tenant's last-sync timestamp.
+
+.PARAMETER DisableSync
+Requests that tenant-wide directory synchronization be disabled. Without this
+switch, the script performs an audit only.
+
+.PARAMETER IHaveVerifiedNoSyncAgents
+Confirms that you checked Entra ID > Hybrid management > Microsoft Entra
+Connect and found no active Connect Sync server or Cloud Sync agent. Required
+with -DisableSync, except during a -WhatIf run.
+
+.PARAMETER TenantId
+Optional tenant GUID or verified domain to pass to Connect-MgGraph. Use this
+when you want to force authentication into a specific customer tenant.
+
+.PARAMETER ConfirmationTenantId
+Optional non-interactive safety confirmation. It must exactly match the tenant
+GUID returned by Microsoft Graph. If omitted, the script asks you to type the
+displayed tenant GUID before it makes a change.
+
+.PARAMETER StaleAfterDays
+Number of days after which the last directory sync is considered stale.
+Defaults to 30.
+
+.PARAMETER AllowRecentSync
+Allows disabling when the last sync is newer than StaleAfterDays. Use only for
+a planned and verified decommissioning.
+
+.PARAMETER InstallGraphModule
+Installs Microsoft.Graph.Authentication for the current user if the required
+Graph commands are unavailable.
+
+.PARAMETER PreviewLimit
+Maximum number of synced users and groups included in the local JSON audit
+preview. Counts still reflect all matching objects. Defaults to 25.
+
+.PARAMETER OutputDirectory
+Directory for JSON audit records. Defaults to EntraSyncCleanupLogs beside this
+script.
+
+.PARAMETER KeepConnection
+Leaves the Microsoft Graph session connected when the script finishes.
+
+.EXAMPLE
+PS> .\Disable-StaleEntraDirectorySync.ps1 -InstallGraphModule
+
+Audits whichever tenant you select at sign-in. No tenant settings are changed.
+
+.EXAMPLE
+PS> .\Disable-StaleEntraDirectorySync.ps1 -TenantId contoso.onmicrosoft.com
+
+Audits a specifically selected tenant.
+
+.EXAMPLE
+PS> .\Disable-StaleEntraDirectorySync.ps1 -DisableSync -IHaveVerifiedNoSyncAgents
+
+Audits the selected tenant, requires you to type its tenant GUID, and then
+requests that directory sync be disabled.
+
+.EXAMPLE
+PS> .\Disable-StaleEntraDirectorySync.ps1 -DisableSync -WhatIf
+
+Runs the audit and shows the proposed change without making it.
+
+.NOTES
+Microsoft states that deactivation can take up to 72 hours and that directory
+sync cannot be re-enabled for 72 hours after it is disabled.
+
+Required administrator role: Hybrid Identity Administrator or an appropriately
+privileged administrator such as Global Administrator.
+
+.LINK
+https://learn.microsoft.com/microsoft-365/enterprise/turn-off-directory-synchronization
+#>
+
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
+param(
+    [switch]$DisableSync,
+
+    [switch]$IHaveVerifiedNoSyncAgents,
+
+    [string]$TenantId,
+
+    [string]$ConfirmationTenantId,
+
+    [ValidateRange(1, 3650)]
+    [int]$StaleAfterDays = 30,
+
+    [switch]$AllowRecentSync,
+
+    [switch]$InstallGraphModule,
+
+    [ValidateRange(1, 100)]
+    [int]$PreviewLimit = 25,
+
+    [string]$OutputDirectory,
+
+    [switch]$KeepConnection
+)
+
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Stop'
+
+function Write-Section {
+    param([Parameter(Mandatory)][string]$Text)
+
+    Write-Host ''
+    Write-Host ('=' * 72) -ForegroundColor DarkCyan
+    Write-Host $Text -ForegroundColor Cyan
+    Write-Host ('=' * 72) -ForegroundColor DarkCyan
+}
+
+function Ensure-GraphAuthenticationModule {
+    $requiredCommands = @('Connect-MgGraph', 'Get-MgContext', 'Invoke-MgGraphRequest')
+    $missingCommands = @(
+        foreach ($command in $requiredCommands) {
+            if (-not (Get-Command -Name $command -ErrorAction SilentlyContinue)) {
+                $command
+            }
+        }
+    )
+
+    if ($missingCommands.Count -eq 0) {
+        return
+    }
+
+    if (-not $InstallGraphModule) {
+        throw "Microsoft.Graph.Authentication is required. Re-run with -InstallGraphModule, or run: Install-Module Microsoft.Graph.Authentication -Scope CurrentUser"
+    }
+
+    Write-Host 'Installing Microsoft.Graph.Authentication for the current user...' -ForegroundColor Yellow
+
+    if ($PSVersionTable.PSVersion.Major -le 5) {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    }
+
+    Install-Module -Name Microsoft.Graph.Authentication -Scope CurrentUser -Repository PSGallery -Force -AllowClobber
+    Import-Module Microsoft.Graph.Authentication -Force
+
+    foreach ($command in $requiredCommands) {
+        if (-not (Get-Command -Name $command -ErrorAction SilentlyContinue)) {
+            throw "The Graph module installed, but command '$command' is still unavailable. Open a new PowerShell session and try again."
+        }
+    }
+}
+
+function Invoke-GraphGet {
+    param(
+        [Parameter(Mandatory)][string]$Uri,
+        [hashtable]$Headers
+    )
+
+    $invokeParameters = @{
+        Method     = 'GET'
+        Uri        = $Uri
+        OutputType = 'PSObject'
+        ErrorAction = 'Stop'
+    }
+
+    if ($Headers) {
+        $invokeParameters.Headers = $Headers
+    }
+
+    Invoke-MgGraphRequest @invokeParameters
+}
+
+function Get-DirectoryOrganization {
+    $response = Invoke-GraphGet -Uri 'https://graph.microsoft.com/v1.0/organization?$select=id,displayName,onPremisesSyncEnabled,onPremisesLastSyncDateTime,verifiedDomains'
+    $organizations = @($response.value)
+
+    if ($organizations.Count -ne 1) {
+        throw "Expected one organization from Microsoft Graph, but received $($organizations.Count)."
+    }
+
+    $organizations[0]
+}
+
+function Get-SyncedObjectSnapshot {
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('users', 'groups')]
+        [string]$Resource,
+
+        [Parameter(Mandatory)]
+        [string]$SelectProperties
+    )
+
+    $uri = 'https://graph.microsoft.com/v1.0/{0}?%24filter=onPremisesSyncEnabled%20eq%20true&%24count=true&%24top={1}&%24select={2}' -f $Resource, $PreviewLimit, $SelectProperties
+    $response = Invoke-GraphGet -Uri $uri -Headers @{ ConsistencyLevel = 'eventual' }
+
+    $countProperty = $response.PSObject.Properties['@odata.count']
+    $count = if ($null -ne $countProperty) {
+        [int]$countProperty.Value
+    }
+    else {
+        @($response.value).Count
+    }
+
+    [pscustomobject]@{
+        Count   = $count
+        Preview = @($response.value)
+    }
+}
+
+function Get-DefaultVerifiedDomain {
+    param([Parameter(Mandatory)]$Organization)
+
+    $verifiedDomains = @($Organization.verifiedDomains)
+    $defaultDomain = @($verifiedDomains | Where-Object { $_.isDefault -eq $true } | Select-Object -First 1)
+
+    if ($defaultDomain.Count -eq 1) {
+        return [string]$defaultDomain[0].name
+    }
+
+    $initialDomain = @($verifiedDomains | Where-Object { $_.isInitial -eq $true } | Select-Object -First 1)
+    if ($initialDomain.Count -eq 1) {
+        return [string]$initialDomain[0].name
+    }
+
+    return '(no verified domain returned)'
+}
+
+function Save-AuditRecord {
+    param(
+        [Parameter(Mandatory)]$Record,
+        [Parameter(Mandatory)][string]$Directory,
+        [Parameter(Mandatory)][string]$Domain
+    )
+
+    if (-not (Test-Path -LiteralPath $Directory)) {
+        New-Item -ItemType Directory -Path $Directory -Force | Out-Null
+    }
+
+    $safeDomain = $Domain -replace '[^a-zA-Z0-9._-]', '_'
+    $timestamp = (Get-Date).ToUniversalTime().ToString('yyyyMMdd-HHmmss')
+    $path = Join-Path $Directory ("EntraSyncAudit-{0}-{1}.json" -f $safeDomain, $timestamp)
+
+    $Record | ConvertTo-Json -Depth 10 | Out-File -LiteralPath $path -Encoding utf8
+    return $path
+}
+
+if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
+    $baseDirectory = if ([string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+        (Get-Location).Path
+    }
+    else {
+        $PSScriptRoot
+    }
+
+    $OutputDirectory = Join-Path $baseDirectory 'EntraSyncCleanupLogs'
+}
+
+$connectedByScript = $false
+$auditRecord = $null
+$auditPath = $null
+$defaultDomain = 'unknown-tenant'
+
+try {
+    Ensure-GraphAuthenticationModule
+
+    Write-Section 'Microsoft Entra connection'
+
+    $connectParameters = @{
+        Scopes       = @('Organization.ReadWrite.All', 'Directory.ReadWrite.All')
+        ContextScope = 'Process'
+        ErrorAction  = 'Stop'
+    }
+
+    if ((Get-Command Connect-MgGraph).Parameters.ContainsKey('NoWelcome')) {
+        $connectParameters.NoWelcome = $true
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($TenantId)) {
+        $connectParameters.TenantId = $TenantId
+    }
+
+    Connect-MgGraph @connectParameters | Out-Null
+    $connectedByScript = $true
+
+    $context = Get-MgContext
+    $organization = Get-DirectoryOrganization
+    $defaultDomain = Get-DefaultVerifiedDomain -Organization $organization
+
+    $syncEnabled = $organization.onPremisesSyncEnabled -eq $true
+    $lastSyncUtc = $null
+    $daysSinceLastSync = $null
+
+    if ($null -ne $organization.onPremisesLastSyncDateTime -and -not [string]::IsNullOrWhiteSpace([string]$organization.onPremisesLastSyncDateTime)) {
+        $lastSyncUtc = ([datetimeoffset]$organization.onPremisesLastSyncDateTime).ToUniversalTime()
+        $daysSinceLastSync = [math]::Floor(((Get-Date).ToUniversalTime() - $lastSyncUtc.UtcDateTime).TotalDays)
+    }
+
+    $isStale = $syncEnabled -and (($null -eq $lastSyncUtc) -or ($daysSinceLastSync -ge $StaleAfterDays))
+
+    Write-Host ("Tenant name:       {0}" -f $organization.displayName) -ForegroundColor White
+    Write-Host ("Default domain:    {0}" -f $defaultDomain) -ForegroundColor White
+    Write-Host ("Tenant ID:         {0}" -f $organization.id) -ForegroundColor Yellow
+    Write-Host ("Signed-in account: {0}" -f $context.Account) -ForegroundColor DarkGray
+
+    Write-Section 'Directory sync audit'
+
+    Write-Host ("Directory sync enabled: {0}" -f $syncEnabled) -ForegroundColor $(if ($syncEnabled) { 'Yellow' } else { 'Green' })
+    Write-Host ("Last directory sync:    {0}" -f $(if ($lastSyncUtc) { $lastSyncUtc.ToString('u') } else { 'Never / not returned' }))
+    Write-Host ("Days since last sync:   {0}" -f $(if ($null -ne $daysSinceLastSync) { $daysSinceLastSync } else { 'N/A' }))
+    Write-Host ("Stale threshold:        {0} days" -f $StaleAfterDays)
+
+    $userSnapshot = $null
+    $groupSnapshot = $null
+    $objectAuditError = $null
+
+    try {
+        $userSnapshot = Get-SyncedObjectSnapshot -Resource users -SelectProperties 'id,displayName,userPrincipalName,onPremisesSyncEnabled'
+        $groupSnapshot = Get-SyncedObjectSnapshot -Resource groups -SelectProperties 'id,displayName,mail,onPremisesSyncEnabled'
+
+        Write-Host ("Users marked as synced: {0}" -f $userSnapshot.Count)
+        Write-Host ("Groups marked as synced: {0}" -f $groupSnapshot.Count)
+    }
+    catch {
+        $objectAuditError = $_.Exception.Message
+        Write-Warning "Could not count synced users/groups: $objectAuditError"
+    }
+
+    $action = if ($DisableSync) { 'Disable requested' } else { 'Audit only' }
+
+    $auditRecord = [ordered]@{
+        AuditTimestampUtc       = (Get-Date).ToUniversalTime().ToString('o')
+        TenantDisplayName       = [string]$organization.displayName
+        DefaultDomain           = $defaultDomain
+        TenantId                = [string]$organization.id
+        SignedInAccount         = [string]$context.Account
+        DirectorySyncEnabledBefore = $syncEnabled
+        LastDirectorySyncUtc    = if ($lastSyncUtc) { $lastSyncUtc.ToString('o') } else { $null }
+        DaysSinceLastSync       = $daysSinceLastSync
+        StaleAfterDays          = $StaleAfterDays
+        ConsideredStale         = $isStale
+        SyncedUserCount         = if ($userSnapshot) { $userSnapshot.Count } else { $null }
+        SyncedGroupCount        = if ($groupSnapshot) { $groupSnapshot.Count } else { $null }
+        SyncedUserPreview       = if ($userSnapshot) { $userSnapshot.Preview } else { @() }
+        SyncedGroupPreview      = if ($groupSnapshot) { $groupSnapshot.Preview } else { @() }
+        ObjectAuditError        = $objectAuditError
+        RequestedAction         = $action
+        DisableRequestSubmitted = $false
+        DirectorySyncEnabledAfterRequest = $null
+        Notes                   = @()
+    }
+
+    if (-not $DisableSync) {
+        Write-Host ''
+        Write-Host 'AUDIT ONLY: no tenant settings were changed.' -ForegroundColor Green
+
+        if ($syncEnabled -and $isStale) {
+            Write-Host 'This tenant appears to have stale directory sync enabled.' -ForegroundColor Yellow
+            Write-Host 'After verifying there are no active sync agents, re-run with:' -ForegroundColor Yellow
+            Write-Host '  -DisableSync -IHaveVerifiedNoSyncAgents' -ForegroundColor Cyan
+        }
+        elseif (-not $syncEnabled) {
+            Write-Host 'Directory synchronization is already disabled.' -ForegroundColor Green
+        }
+    }
+    elseif (-not $syncEnabled) {
+        Write-Host ''
+        Write-Host 'No change required: directory synchronization is already disabled.' -ForegroundColor Green
+        $auditRecord.Notes += 'No change required because directory sync was already disabled.'
+    }
+    else {
+        if (-not $WhatIfPreference -and -not $IHaveVerifiedNoSyncAgents) {
+            throw 'Refusing to disable sync. First verify there are no active Connect Sync servers or Cloud Sync agents, then add -IHaveVerifiedNoSyncAgents.'
+        }
+
+        if (-not $isStale -and -not $AllowRecentSync -and -not $WhatIfPreference) {
+            throw "The most recent sync is newer than $StaleAfterDays days. If this is a planned decommissioning, review the tenant and add -AllowRecentSync."
+        }
+
+        if (-not $WhatIfPreference) {
+            Write-Host ''
+            Write-Host 'WARNING: This changes the source of authority for synced users and groups to the cloud.' -ForegroundColor Red
+            Write-Host 'Microsoft states that processing can take up to 72 hours.' -ForegroundColor Yellow
+            Write-Host 'Directory sync cannot be re-enabled for 72 hours after disabling it.' -ForegroundColor Yellow
+
+            $providedConfirmation = $ConfirmationTenantId
+            if ([string]::IsNullOrWhiteSpace($providedConfirmation)) {
+                $providedConfirmation = Read-Host "Type the tenant ID '$($organization.id)' to continue"
+            }
+
+            if ($providedConfirmation.Trim() -ne [string]$organization.id) {
+                throw 'Tenant confirmation did not match. No change was made.'
+            }
+        }
+
+        $targetDescription = "directory synchronization for $($organization.displayName) [$defaultDomain] tenant $($organization.id)"
+
+        if ($PSCmdlet.ShouldProcess($targetDescription, 'Set onPremisesSyncEnabled to false')) {
+            $requestBody = @{ onPremisesSyncEnabled = $false } | ConvertTo-Json -Compress
+
+            Invoke-MgGraphRequest `
+                -Method PATCH `
+                -Uri ("https://graph.microsoft.com/v1.0/organization/{0}" -f $organization.id) `
+                -Body $requestBody `
+                -ContentType 'application/json' `
+                -OutputType PSObject `
+                -ErrorAction Stop | Out-Null
+
+            $auditRecord.DisableRequestSubmitted = $true
+            $auditRecord.Notes += 'A request to set onPremisesSyncEnabled to false was accepted by Microsoft Graph.'
+
+            Start-Sleep -Seconds 2
+            $organizationAfter = Get-DirectoryOrganization
+            $syncEnabledAfter = $organizationAfter.onPremisesSyncEnabled -eq $true
+            $auditRecord.DirectorySyncEnabledAfterRequest = $syncEnabledAfter
+
+            Write-Host ''
+            Write-Host 'Disable request accepted by Microsoft Graph.' -ForegroundColor Green
+            Write-Host ("Current reported state: onPremisesSyncEnabled = {0}" -f $syncEnabledAfter) -ForegroundColor Yellow
+
+            if ($syncEnabledAfter) {
+                Write-Host 'The state can remain True while Microsoft processes the change. Re-run the audit later.' -ForegroundColor Yellow
+            }
+            else {
+                Write-Host 'Directory synchronization now reports as disabled.' -ForegroundColor Green
+            }
+        }
+        else {
+            $auditRecord.Notes += 'No change was made because ShouldProcess did not approve the action.'
+        }
+    }
+
+    $auditPath = Save-AuditRecord -Record $auditRecord -Directory $OutputDirectory -Domain $defaultDomain
+    Write-Host ''
+    Write-Host ("Audit saved: {0}" -f $auditPath) -ForegroundColor DarkGray
+
+    [pscustomobject]@{
+        Tenant                 = $organization.displayName
+        DefaultDomain         = $defaultDomain
+        TenantId               = $organization.id
+        SyncEnabledBefore      = $syncEnabled
+        LastSyncUtc            = $lastSyncUtc
+        DaysSinceLastSync      = $daysSinceLastSync
+        SyncedUsers            = if ($userSnapshot) { $userSnapshot.Count } else { $null }
+        SyncedGroups           = if ($groupSnapshot) { $groupSnapshot.Count } else { $null }
+        DisableRequestSubmitted = [bool]$auditRecord.DisableRequestSubmitted
+        AuditPath              = $auditPath
+    }
+}
+catch {
+    $failureMessage = $_.Exception.Message
+
+    if ($null -ne $auditRecord -and [string]::IsNullOrWhiteSpace($auditPath)) {
+        $auditRecord.Notes += "Script stopped: $failureMessage"
+
+        try {
+            $auditPath = Save-AuditRecord -Record $auditRecord -Directory $OutputDirectory -Domain $defaultDomain
+            Write-Host ''
+            Write-Host ("Audit saved before exit: {0}" -f $auditPath) -ForegroundColor DarkGray
+        }
+        catch {
+            Write-Warning "The script also failed to save its audit record: $($_.Exception.Message)"
+        }
+    }
+
+    throw
+}
+finally {
+    if ($connectedByScript -and -not $KeepConnection) {
+        Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+    }
+}
