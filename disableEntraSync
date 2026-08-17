@@ -57,10 +57,9 @@ Legacy compatibility switch. Starting a clean connection is now the default.
 Attempts to reuse a suitable existing Graph context. This is disabled by
 default because stale Windows WAM contexts can trigger the wrong login popup.
 
-.PARAMETER ConfirmationTenantId
-Optional non-interactive safety confirmation. It must exactly match the tenant
-GUID returned by Microsoft Graph. If omitted, the script asks you to type the
-displayed tenant GUID before it makes a change.
+.PARAMETER Confirmation
+Optional non-interactive safety confirmation. Supply YES to approve the change.
+For backwards compatibility, the exact tenant GUID is also accepted.
 
 .PARAMETER StaleAfterDays
 Number of days after which the last directory sync is considered stale.
@@ -147,7 +146,8 @@ param(
 
     [switch]$ReuseExistingConnection,
 
-    [string]$ConfirmationTenantId,
+    [Alias('ConfirmationTenantId')]
+    [string]$Confirmation,
 
     [ValidateRange(1, 3650)]
     [int]$StaleAfterDays = 30,
@@ -166,9 +166,9 @@ param(
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
-$toolVersion = '1.2.0'
+$toolVersion = '1.4.0'
 
-$interactivePipelineMode = $PSBoundParameters.Count -eq 0
+$interactivePipelineMode = [string]::IsNullOrWhiteSpace($TenantId)
 
 if ($interactivePipelineMode) {
     Write-Host ''
@@ -181,10 +181,18 @@ if ($interactivePipelineMode) {
     }
     until (-not [string]::IsNullOrWhiteSpace($TenantId))
 
-    $selectedAction = (Read-Host 'Choose [A] Audit only (default) or [D] Disable directory sync').Trim()
+    if (-not $DisableSync) {
+        $selectedAction = (Read-Host 'Choose [A] Audit only (default) or [D] Disable directory sync').Trim()
 
-    if ($selectedAction -match '^(d|disable)$') {
-        $DisableSync = $true
+        if ($selectedAction -match '^(d|disable)$') {
+            $DisableSync = $true
+        }
+        elseif (-not [string]::IsNullOrWhiteSpace($selectedAction) -and $selectedAction -notmatch '^(a|audit)$') {
+            throw "Unknown selection '$selectedAction'. No change was made."
+        }
+    }
+
+    if ($DisableSync -and -not $IHaveVerifiedNoSyncAgents) {
         $agentConfirmation = (Read-Host 'After checking Entra Connect, type VERIFIED if there are no active Connect Sync or Cloud Sync agents').Trim()
 
         if ($agentConfirmation -ne 'VERIFIED') {
@@ -192,9 +200,6 @@ if ($interactivePipelineMode) {
         }
 
         $IHaveVerifiedNoSyncAgents = $true
-    }
-    elseif (-not [string]::IsNullOrWhiteSpace($selectedAction) -and $selectedAction -notmatch '^(a|audit)$') {
-        throw "Unknown selection '$selectedAction'. No change was made."
     }
 
     # A literal irm | iex invocation cannot conveniently pass this bootstrap
@@ -446,10 +451,6 @@ try {
             ErrorAction  = 'Stop'
         }
 
-        if ($connectCommand.Parameters.ContainsKey('NoWelcome')) {
-            $connectParameters.NoWelcome = $true
-        }
-
         if (-not [string]::IsNullOrWhiteSpace($TenantId)) {
             $connectParameters.TenantId = $TenantId
         }
@@ -475,7 +476,7 @@ try {
             Write-Host 'Starting interactive/WAM sign-in...' -ForegroundColor Cyan
         }
 
-        Connect-MgGraph @connectParameters | Out-Null
+        Connect-MgGraph @connectParameters
         $connectedByScript = $true
 
         $context = Get-MgContext
@@ -583,19 +584,32 @@ try {
             Write-Host 'Microsoft states that processing can take up to 72 hours.' -ForegroundColor Yellow
             Write-Host 'Directory sync cannot be re-enabled for 72 hours after disabling it.' -ForegroundColor Yellow
 
-            $providedConfirmation = $ConfirmationTenantId
+            $providedConfirmation = $Confirmation
             if ([string]::IsNullOrWhiteSpace($providedConfirmation)) {
-                $providedConfirmation = Read-Host "Type the tenant ID '$($organization.id)' to continue"
+                $providedConfirmation = Read-Host "Type YES to disable directory sync for $($organization.displayName) [$defaultDomain]"
             }
 
-            if ($providedConfirmation.Trim() -ne [string]$organization.id) {
-                throw 'Tenant confirmation did not match. No change was made.'
+            $providedConfirmation = $providedConfirmation.Trim() -replace '^[\s''"]+|[\s''"]+$', ''
+
+            if ($providedConfirmation -ne 'YES' -and $providedConfirmation -ne [string]$organization.id) {
+                throw 'Confirmation was not YES. No change was made.'
             }
         }
 
         $targetDescription = "directory synchronization for $($organization.displayName) [$defaultDomain] tenant $($organization.id)"
 
-        if ($PSCmdlet.ShouldProcess($targetDescription, 'Set onPremisesSyncEnabled to false')) {
+        $shouldSubmitDisable = $true
+        $psCmdletVariable = Get-Variable -Name PSCmdlet -ErrorAction SilentlyContinue
+
+        if ($null -ne $psCmdletVariable -and $null -ne $psCmdletVariable.Value) {
+            $shouldSubmitDisable = $psCmdletVariable.Value.ShouldProcess($targetDescription, 'Set onPremisesSyncEnabled to false')
+        }
+        elseif ($WhatIfPreference) {
+            Write-Host ("What if: Set onPremisesSyncEnabled to false for {0}" -f $targetDescription) -ForegroundColor Yellow
+            $shouldSubmitDisable = $false
+        }
+
+        if ($shouldSubmitDisable) {
             $requestBody = @{ onPremisesSyncEnabled = $false } | ConvertTo-Json -Compress
 
             Invoke-MgGraphRequest `
@@ -626,7 +640,7 @@ try {
             }
         }
         else {
-            $auditRecord.Notes += 'No change was made because ShouldProcess did not approve the action.'
+            $auditRecord.Notes += 'No change was made because the operation was not approved or WhatIf was active.'
         }
     }
 
