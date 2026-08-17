@@ -166,9 +166,9 @@ param(
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
-$toolVersion = '1.2.0'
+$toolVersion = '1.3.0'
 
-$interactivePipelineMode = $PSBoundParameters.Count -eq 0
+$interactivePipelineMode = [string]::IsNullOrWhiteSpace($TenantId)
 
 if ($interactivePipelineMode) {
     Write-Host ''
@@ -181,10 +181,18 @@ if ($interactivePipelineMode) {
     }
     until (-not [string]::IsNullOrWhiteSpace($TenantId))
 
-    $selectedAction = (Read-Host 'Choose [A] Audit only (default) or [D] Disable directory sync').Trim()
+    if (-not $DisableSync) {
+        $selectedAction = (Read-Host 'Choose [A] Audit only (default) or [D] Disable directory sync').Trim()
 
-    if ($selectedAction -match '^(d|disable)$') {
-        $DisableSync = $true
+        if ($selectedAction -match '^(d|disable)$') {
+            $DisableSync = $true
+        }
+        elseif (-not [string]::IsNullOrWhiteSpace($selectedAction) -and $selectedAction -notmatch '^(a|audit)$') {
+            throw "Unknown selection '$selectedAction'. No change was made."
+        }
+    }
+
+    if ($DisableSync -and -not $IHaveVerifiedNoSyncAgents) {
         $agentConfirmation = (Read-Host 'After checking Entra Connect, type VERIFIED if there are no active Connect Sync or Cloud Sync agents').Trim()
 
         if ($agentConfirmation -ne 'VERIFIED') {
@@ -192,9 +200,6 @@ if ($interactivePipelineMode) {
         }
 
         $IHaveVerifiedNoSyncAgents = $true
-    }
-    elseif (-not [string]::IsNullOrWhiteSpace($selectedAction) -and $selectedAction -notmatch '^(a|audit)$') {
-        throw "Unknown selection '$selectedAction'. No change was made."
     }
 
     # A literal irm | iex invocation cannot conveniently pass this bootstrap
@@ -446,10 +451,6 @@ try {
             ErrorAction  = 'Stop'
         }
 
-        if ($connectCommand.Parameters.ContainsKey('NoWelcome')) {
-            $connectParameters.NoWelcome = $true
-        }
-
         if (-not [string]::IsNullOrWhiteSpace($TenantId)) {
             $connectParameters.TenantId = $TenantId
         }
@@ -475,7 +476,7 @@ try {
             Write-Host 'Starting interactive/WAM sign-in...' -ForegroundColor Cyan
         }
 
-        Connect-MgGraph @connectParameters | Out-Null
+        Connect-MgGraph @connectParameters
         $connectedByScript = $true
 
         $context = Get-MgContext
