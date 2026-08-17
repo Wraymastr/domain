@@ -12,7 +12,13 @@ and writes a JSON audit record.
 Device-code authentication is used by default because recent Microsoft Graph
 modules route ordinary Windows sign-in through Web Account Manager (WAM), which
 can select the wrong account provider during customer-tenant administration.
-If a suitable Graph session already exists, the script reuses it by default.
+The script starts a clean device-code session by default. Reusing a cached
+Graph session is opt-in because a stale WAM-backed context can reopen the
+broken Windows account picker before device-code authentication starts.
+
+When invoked without parameters (including `irm <url> | iex`), the script runs
+an interactive setup that asks for the tenant and whether to audit or disable
+sync.
 
 The script is audit-only unless -DisableSync is supplied. Disabling sync is a
 tenant-wide change that converts formerly synced users and groups to cloud-
@@ -45,8 +51,11 @@ Optional work-account UPN supplied to Connect-MgGraph when the installed Graph
 module supports LoginHint. This is mainly useful with Interactive mode.
 
 .PARAMETER ForceNewConnection
-Ignores any suitable existing Graph context and starts a new authentication
-flow. By default, a valid existing context with the required scopes is reused.
+Legacy compatibility switch. Starting a clean connection is now the default.
+
+.PARAMETER ReuseExistingConnection
+Attempts to reuse a suitable existing Graph context. This is disabled by
+default because stale Windows WAM contexts can trigger the wrong login popup.
 
 .PARAMETER ConfirmationTenantId
 Optional non-interactive safety confirmation. It must exactly match the tenant
@@ -70,8 +79,8 @@ Maximum number of synced users and groups included in the local JSON audit
 preview. Counts still reflect all matching objects. Defaults to 25.
 
 .PARAMETER OutputDirectory
-Directory for JSON audit records. Defaults to EntraSyncCleanupLogs beside this
-script.
+Directory for JSON audit records. Defaults to EntraSyncCleanupLogs beside a
+local script, or in Documents when executed through `irm | iex`.
 
 .PARAMETER KeepConnection
 Leaves a Microsoft Graph session opened by this script connected when it
@@ -82,6 +91,12 @@ PS> .\Disable-StaleEntraDirectorySync.ps1 -InstallGraphModule
 
 Audits whichever tenant you select using device-code sign-in. No tenant
 settings are changed.
+
+.EXAMPLE
+PS> irm https://example.org/disableEntraSync | iex
+
+Starts the interactive remote mode: prompts for a tenant, defaults to an audit,
+and uses device-code authentication without a WAM popup.
 
 .EXAMPLE
 PS> .\Disable-StaleEntraDirectorySync.ps1 -TenantId contoso.onmicrosoft.com
@@ -130,6 +145,8 @@ param(
 
     [switch]$ForceNewConnection,
 
+    [switch]$ReuseExistingConnection,
+
     [string]$ConfirmationTenantId,
 
     [ValidateRange(1, 3650)]
@@ -149,6 +166,41 @@ param(
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
+$toolVersion = '1.2.0'
+
+$interactivePipelineMode = $PSBoundParameters.Count -eq 0
+
+if ($interactivePipelineMode) {
+    Write-Host ''
+    Write-Host ("Microsoft Entra stale directory-sync tool v{0}" -f $toolVersion) -ForegroundColor Cyan
+    Write-Host 'Device-code authentication will be used; no Windows login popup is required.' -ForegroundColor DarkGray
+    Write-Host ''
+
+    do {
+        $TenantId = (Read-Host 'Enter the tenant ID or onmicrosoft.com domain').Trim()
+    }
+    until (-not [string]::IsNullOrWhiteSpace($TenantId))
+
+    $selectedAction = (Read-Host 'Choose [A] Audit only (default) or [D] Disable directory sync').Trim()
+
+    if ($selectedAction -match '^(d|disable)$') {
+        $DisableSync = $true
+        $agentConfirmation = (Read-Host 'After checking Entra Connect, type VERIFIED if there are no active Connect Sync or Cloud Sync agents').Trim()
+
+        if ($agentConfirmation -ne 'VERIFIED') {
+            throw 'Sync-agent verification was not confirmed. No change was made.'
+        }
+
+        $IHaveVerifiedNoSyncAgents = $true
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($selectedAction) -and $selectedAction -notmatch '^(a|audit)$') {
+        throw "Unknown selection '$selectedAction'. No change was made."
+    }
+
+    # A literal irm | iex invocation cannot conveniently pass this bootstrap
+    # switch, so install the minimal Graph authentication module if required.
+    $InstallGraphModule = $true
+}
 
 function Write-Section {
     param([Parameter(Mandatory)][string]$Text)
@@ -333,7 +385,13 @@ function Save-AuditRecord {
 
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
     $baseDirectory = if ([string]::IsNullOrWhiteSpace($PSScriptRoot)) {
-        (Get-Location).Path
+        $documentsDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::MyDocuments)
+        if ([string]::IsNullOrWhiteSpace($documentsDirectory)) {
+            [IO.Path]::GetTempPath()
+        }
+        else {
+            $documentsDirectory
+        }
     }
     else {
         $PSScriptRoot
@@ -357,7 +415,7 @@ try {
     $context = $null
     $organization = $null
 
-    if (-not $ForceNewConnection) {
+    if ($ReuseExistingConnection -and -not $ForceNewConnection) {
         $candidateContext = Get-MgContext -ErrorAction SilentlyContinue
 
         if ($null -ne $candidateContext -and (Test-GraphContextHasRequiredScopes -Context $candidateContext -RequiredScopes $requiredScopes)) {
@@ -469,6 +527,7 @@ try {
 
     $auditRecord = [ordered]@{
         AuditTimestampUtc       = (Get-Date).ToUniversalTime().ToString('o')
+        ToolVersion             = $toolVersion
         TenantDisplayName       = [string]$organization.displayName
         DefaultDomain           = $defaultDomain
         TenantId                = [string]$organization.id
