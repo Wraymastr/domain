@@ -1,0 +1,527 @@
+#requires -Version 5.1
+
+<#
+.SYNOPSIS
+Federates a verified Microsoft Entra custom domain to Google Workspace.
+
+.DESCRIPTION
+Reads the Google issuer URI, SSO endpoint, and signing certificate directly
+from a GoogleIDPMetadata.xml file downloaded from the Google Admin console.
+
+The script:
+  - requires sign-in with an administrator on the tenant's initial
+    .onmicrosoft.com domain;
+  - validates the Google metadata and certificate;
+  - audits the current Entra domain/federation state;
+  - saves the pre-change state to Documents;
+  - refuses to overwrite a conflicting federation configuration;
+  - creates a new federation object, or safely re-enables a matching object;
+  - verifies the resulting Entra configuration.
+
+Google Admin settings such as Signed response and Name ID mapping are not
+reliably represented in the metadata XML and must be confirmed manually.
+
+.PARAMETER TenantId
+The tenant's initial domain, for example contososchool.onmicrosoft.com.
+
+.PARAMETER DomainId
+The verified custom domain to federate, for example contoso.school.nz.
+
+.PARAMETER MetadataPath
+Path to the GoogleIDPMetadata.xml file. If omitted, the script looks beside
+itself and in Downloads, then prompts if exactly one file cannot be selected.
+
+.PARAMETER GraphVersion
+Microsoft Graph PowerShell version to load. Version 2.24.0 is the default
+because later releases have had device-code authentication regressions in
+Windows PowerShell 5.1. Other installed versions are not removed.
+#>
+
+[CmdletBinding()]
+param(
+    [string]$TenantId,
+    [string]$DomainId,
+    [string]$MetadataPath,
+    [string]$DisplayName = 'Google Workspace Identity',
+    [ValidateSet(
+        'acceptIfMfaDoneByFederatedIdp',
+        'enforceMfaByFederatedIdp',
+        'rejectMfaByFederatedIdp'
+    )]
+    [string]$FederatedIdpMfaBehavior = 'acceptIfMfaDoneByFederatedIdp',
+    [version]$GraphVersion = [version]'2.24.0'
+)
+
+$ErrorActionPreference = 'Stop'
+
+function Import-PinnedGraphModules {
+    param([Parameter(Mandatory)][version]$RequiredVersion)
+
+    $moduleNames = @(
+        'Microsoft.Graph.Authentication'
+        'Microsoft.Graph.Identity.DirectoryManagement'
+    )
+
+    $conflictingModules = @(
+        Get-Module -Name 'Microsoft.Graph*' |
+            Where-Object Version -ne $RequiredVersion
+    )
+
+    if ($conflictingModules.Count -gt 0) {
+        $loadedVersions = ($conflictingModules | ForEach-Object {
+            "$($_.Name) $($_.Version)"
+        }) -join ', '
+
+        throw "A different Microsoft Graph version is already loaded ($loadedVersions). Close PowerShell, open a fresh Windows PowerShell window, and retry."
+    }
+
+    foreach ($moduleName in $moduleNames) {
+        $exactVersionInstalled = @(
+            Get-Module -ListAvailable -Name $moduleName |
+                Where-Object Version -eq $RequiredVersion
+        ).Count -gt 0
+
+        if (-not $exactVersionInstalled) {
+            Write-Host "Installing $moduleName version $RequiredVersion..." -ForegroundColor Yellow
+            Install-Module `
+                -Name $moduleName `
+                -RequiredVersion $RequiredVersion `
+                -Scope CurrentUser `
+                -Force `
+                -AllowClobber
+        }
+    }
+
+    Import-Module `
+        -Name 'Microsoft.Graph.Authentication' `
+        -RequiredVersion $RequiredVersion `
+        -ErrorAction Stop
+    Import-Module `
+        -Name 'Microsoft.Graph.Identity.DirectoryManagement' `
+        -RequiredVersion $RequiredVersion `
+        -ErrorAction Stop
+
+    $loadedAuthentication = Get-Module -Name 'Microsoft.Graph.Authentication'
+    if ($loadedAuthentication.Version -ne $RequiredVersion) {
+        throw "Microsoft.Graph.Authentication $($loadedAuthentication.Version) loaded instead of required version $RequiredVersion. Close PowerShell and retry in a fresh window."
+    }
+}
+
+function Resolve-GoogleMetadataPath {
+    param([string]$RequestedPath)
+
+    if (-not [string]::IsNullOrWhiteSpace($RequestedPath)) {
+        $cleanPath = $RequestedPath.Trim().Trim('"')
+        return (Resolve-Path -LiteralPath $cleanPath -ErrorAction Stop).Path
+    }
+
+    $searchDirectories = [System.Collections.Generic.List[string]]::new()
+    if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+        $searchDirectories.Add($PSScriptRoot)
+    }
+
+    $downloads = Join-Path ([Environment]::GetFolderPath('UserProfile')) 'Downloads'
+    if (-not $searchDirectories.Contains($downloads)) {
+        $searchDirectories.Add($downloads)
+    }
+
+    $candidates = @(
+        foreach ($directory in $searchDirectories) {
+            if (Test-Path -LiteralPath $directory) {
+                Get-ChildItem `
+                    -LiteralPath $directory `
+                    -Filter 'GoogleIDPMetadata*.xml' `
+                    -File `
+                    -ErrorAction SilentlyContinue
+            }
+        }
+    ) | Sort-Object FullName -Unique
+
+    if ($candidates.Count -eq 1) {
+        Write-Host "Using Google metadata: $($candidates[0].FullName)" -ForegroundColor Green
+        return $candidates[0].FullName
+    }
+
+    if ($candidates.Count -gt 1) {
+        Write-Host 'Multiple Google metadata files were found:' -ForegroundColor Yellow
+        foreach ($candidate in $candidates) {
+            Write-Host "  $($candidate.FullName)"
+        }
+    }
+
+    $enteredPath = (Read-Host 'Enter the full path to GoogleIDPMetadata.xml').Trim().Trim('"')
+    return (Resolve-Path -LiteralPath $enteredPath -ErrorAction Stop).Path
+}
+
+function Read-GoogleMetadata {
+    param([Parameter(Mandatory)][string]$Path)
+
+    try {
+        [xml]$metadataXml = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
+    }
+    catch {
+        throw "Unable to read Google metadata XML '$Path': $($_.Exception.Message)"
+    }
+
+    $namespaceManager = [System.Xml.XmlNamespaceManager]::new($metadataXml.NameTable)
+    $namespaceManager.AddNamespace('md', 'urn:oasis:names:tc:SAML:2.0:metadata')
+    $namespaceManager.AddNamespace('ds', 'http://www.w3.org/2000/09/xmldsig#')
+
+    $entity = $metadataXml.SelectSingleNode('/md:EntityDescriptor', $namespaceManager)
+    if ($null -eq $entity) {
+        throw 'The XML does not contain a SAML EntityDescriptor.'
+    }
+
+    $issuerUri = [string]$entity.GetAttribute('entityID')
+    $issuerMatch = [regex]::Match(
+        $issuerUri,
+        '^https://accounts\.google\.com/o/saml2\?idpid=([^&]+)$',
+        [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+    )
+    if (-not $issuerMatch.Success) {
+        throw "The metadata issuer is not a recognised Google Workspace issuer: $issuerUri"
+    }
+
+    $services = @(
+        $entity.SelectNodes(
+            'md:IDPSSODescriptor/md:SingleSignOnService',
+            $namespaceManager
+        )
+    )
+    if ($services.Count -eq 0) {
+        throw 'The metadata contains no Google SingleSignOnService endpoint.'
+    }
+
+    $selectedService = @(
+        $services | Where-Object {
+            $_.GetAttribute('Binding') -match 'HTTP-Redirect$'
+        }
+    ) | Select-Object -First 1
+
+    if ($null -eq $selectedService) {
+        $selectedService = $services | Select-Object -First 1
+    }
+
+    $signInUri = [string]$selectedService.GetAttribute('Location')
+    $signInMatch = [regex]::Match(
+        $signInUri,
+        '^https://accounts\.google\.com/o/saml2/idp\?idpid=([^&]+)$',
+        [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+    )
+    if (-not $signInMatch.Success) {
+        throw "The metadata sign-in endpoint is not a recognised Google Workspace endpoint: $signInUri"
+    }
+
+    if ($issuerMatch.Groups[1].Value -cne $signInMatch.Groups[1].Value) {
+        throw 'The Google IdP identifier differs between the issuer and sign-in endpoint.'
+    }
+
+    $certificateNode = $entity.SelectSingleNode(
+        'md:IDPSSODescriptor/md:KeyDescriptor[@use="signing"]/ds:KeyInfo/ds:X509Data/ds:X509Certificate',
+        $namespaceManager
+    )
+    if ($null -eq $certificateNode) {
+        $certificateNode = $entity.SelectSingleNode(
+            'md:IDPSSODescriptor/md:KeyDescriptor/ds:KeyInfo/ds:X509Data/ds:X509Certificate',
+            $namespaceManager
+        )
+    }
+    if ($null -eq $certificateNode) {
+        throw 'The metadata contains no signing certificate.'
+    }
+
+    $signingCertificate = $certificateNode.InnerText -replace '\s', ''
+    try {
+        $certificateBytes = [Convert]::FromBase64String($signingCertificate)
+        $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($certificateBytes)
+    }
+    catch {
+        throw "The Google signing certificate is invalid: $($_.Exception.Message)"
+    }
+
+    if ($certificate.NotAfter.ToUniversalTime() -le [DateTime]::UtcNow.AddDays(30)) {
+        throw "The Google signing certificate expires too soon: $($certificate.NotAfter.ToUniversalTime().ToString('u'))"
+    }
+
+    $validUntilText = [string]$entity.GetAttribute('validUntil')
+    if (-not [string]::IsNullOrWhiteSpace($validUntilText)) {
+        $metadataValidUntil = [datetime]::Parse(
+            $validUntilText,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::RoundtripKind
+        )
+        if ($metadataValidUntil.ToUniversalTime() -le [DateTime]::UtcNow.AddDays(1)) {
+            throw "The Google metadata is expired: $($metadataValidUntil.ToUniversalTime().ToString('u'))"
+        }
+    }
+
+    return [pscustomobject]@{
+        Path = $Path
+        IssuerUri = $issuerUri
+        SignInUri = $signInUri
+        SignOutUri = 'https://accounts.google.com/logout'
+        SigningCertificate = $signingCertificate
+        CertificateSubject = $certificate.Subject
+        CertificateThumbprint = $certificate.Thumbprint
+        CertificateNotAfterUtc = $certificate.NotAfter.ToUniversalTime()
+        MetadataValidUntil = $validUntilText
+        GoogleIdpId = $issuerMatch.Groups[1].Value
+    }
+}
+
+function Get-FederationConfigurationSafely {
+    param([Parameter(Mandatory)][string]$Domain)
+
+    try {
+        return @(Get-MgDomainFederationConfiguration -DomainId $Domain -ErrorAction Stop)
+    }
+    catch {
+        if ($_.Exception.Message -match '404|Request_ResourceNotFound|does not exist|not found') {
+            return @()
+        }
+
+        throw
+    }
+}
+
+if ([string]::IsNullOrWhiteSpace($TenantId)) {
+    $TenantId = (Read-Host 'Enter the tenant initial domain (example: school.onmicrosoft.com)').Trim()
+}
+if ([string]::IsNullOrWhiteSpace($DomainId)) {
+    $DomainId = (Read-Host 'Enter the verified custom domain to federate').Trim()
+}
+
+$TenantId = $TenantId.Trim().ToLowerInvariant()
+$DomainId = $DomainId.Trim().ToLowerInvariant()
+
+if ($TenantId -notmatch '^[a-z0-9][a-z0-9.-]*\.onmicrosoft\.com$') {
+    throw "TenantId must be the tenant's initial .onmicrosoft.com domain, not '$TenantId'."
+}
+if ($DomainId -notmatch '^[a-z0-9][a-z0-9.-]+\.[a-z]{2,}$' -or $DomainId.EndsWith('.onmicrosoft.com')) {
+    throw "DomainId must be a custom DNS domain, not '$DomainId'."
+}
+if ($TenantId -eq $DomainId) {
+    throw 'The break-glass tenant domain and target custom domain must be different.'
+}
+
+$MetadataPath = Resolve-GoogleMetadataPath -RequestedPath $MetadataPath
+$google = Read-GoogleMetadata -Path $MetadataPath
+
+Write-Host ''
+Write-Host 'Google Workspace -> Microsoft Entra federation tool' -ForegroundColor Cyan
+Write-Host '======================================================' -ForegroundColor Cyan
+Write-Host "Tenant escape hatch: $TenantId"
+Write-Host "Domain to federate:  $DomainId"
+Write-Host "Metadata file:       $($google.Path)"
+Write-Host "Google issuer:       $($google.IssuerUri)"
+Write-Host "Google sign-in:      $($google.SignInUri)"
+Write-Host "Certificate expires: $($google.CertificateNotAfterUtc.ToString('u'))"
+Write-Host ''
+Write-Host "Use an administrator ending in @$TenantId for Graph sign-in." -ForegroundColor Yellow
+Write-Host 'Keep that account signed in until an ordinary user has been tested.' -ForegroundColor Yellow
+
+Import-PinnedGraphModules -RequiredVersion $GraphVersion
+$connected = $false
+
+try {
+    Write-Host ''
+    Write-Host 'Starting Microsoft Graph device-code sign-in...' -ForegroundColor Cyan
+    Connect-MgGraph `
+        -TenantId $TenantId `
+        -Scopes 'Domain.ReadWrite.All','Domain-InternalFederation.ReadWrite.All' `
+        -UseDeviceCode `
+        -ContextScope Process `
+        -NoWelcome
+    $connected = $true
+
+    $context = Get-MgContext
+    if ([string]::IsNullOrWhiteSpace($context.Account)) {
+        throw 'Microsoft Graph did not return the signed-in account name.'
+    }
+
+    Write-Host "Signed in as: $($context.Account)" -ForegroundColor Cyan
+    $expectedAdminSuffix = '@' + [regex]::Escape($TenantId) + '$'
+    if ($context.Account -notmatch $expectedAdminSuffix) {
+        throw "Wrong admin account. Sign in with an administrator ending in @$TenantId, not $($context.Account)."
+    }
+
+    $domain = Get-MgDomain `
+        -DomainId $DomainId `
+        -Property Id,AuthenticationType,IsVerified,IsDefault,IsInitial `
+        -ErrorAction Stop
+    if ($null -eq $domain) {
+        throw "Microsoft Graph returned no domain object for $DomainId. No change has been made."
+    }
+    if (-not $domain.IsVerified) {
+        throw "The Entra domain $DomainId exists but is not verified."
+    }
+
+    $existingFederation = @(Get-FederationConfigurationSafely -Domain $DomainId)
+
+    $safeDomainName = $DomainId -replace '[^a-z0-9.-]', '-'
+    $logDirectory = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'EntraFederationLogs'
+    if (-not (Test-Path -LiteralPath $logDirectory)) {
+        New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
+    }
+
+    $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $backupPath = Join-Path $logDirectory "$safeDomainName-pre-federation-$timestamp.json"
+    $backup = [ordered]@{
+        CapturedAtUtc = [DateTime]::UtcNow.ToString('o')
+        SignedInAs = $context.Account
+        MetadataPath = $google.Path
+        GoogleMetadata = [ordered]@{
+            IssuerUri = $google.IssuerUri
+            SignInUri = $google.SignInUri
+            CertificateSubject = $google.CertificateSubject
+            CertificateThumbprint = $google.CertificateThumbprint
+            CertificateNotAfterUtc = $google.CertificateNotAfterUtc.ToString('o')
+        }
+        Domain = [ordered]@{
+            Id = $domain.Id
+            AuthenticationType = $domain.AuthenticationType
+            IsVerified = $domain.IsVerified
+            IsDefault = $domain.IsDefault
+            IsInitial = $domain.IsInitial
+        }
+        ExistingFederation = @(
+            $existingFederation | ForEach-Object {
+                [ordered]@{
+                    Id = $_.Id
+                    DisplayName = $_.DisplayName
+                    IssuerUri = $_.IssuerUri
+                    ActiveSignInUri = $_.ActiveSignInUri
+                    PassiveSignInUri = $_.PassiveSignInUri
+                    SignOutUri = $_.SignOutUri
+                    PreferredAuthenticationProtocol = $_.PreferredAuthenticationProtocol
+                    FederatedIdpMfaBehavior = $_.FederatedIdpMfaBehavior
+                    SigningCertificate = $_.SigningCertificate
+                }
+            }
+        )
+    }
+    $backup | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $backupPath -Encoding UTF8
+
+    Write-Host ''
+    Write-Host 'Current Entra state' -ForegroundColor Cyan
+    Write-Host "Authentication type:       $($domain.AuthenticationType)"
+    Write-Host "Verified:                  $($domain.IsVerified)"
+    Write-Host "Existing federation count: $($existingFederation.Count)"
+    Write-Host "Pre-change backup:         $backupPath"
+
+    if ($existingFederation.Count -gt 1) {
+        throw 'Multiple federation configurations were returned. No change has been made.'
+    }
+
+    $operation = $null
+    if ($existingFederation.Count -eq 1) {
+        $current = $existingFederation[0]
+        $configurationMatches = (
+            $current.IssuerUri -eq $google.IssuerUri -and
+            $current.PassiveSignInUri -eq $google.SignInUri -and
+            $current.PreferredAuthenticationProtocol -eq 'saml' -and
+            (($current.SigningCertificate -replace '\s', '') -eq $google.SigningCertificate)
+        )
+
+        if (-not $configurationMatches) {
+            throw "A conflicting federation configuration already exists for '$($current.IssuerUri)'. The tool will not overwrite it."
+        }
+
+        if ($domain.AuthenticationType -eq 'Federated') {
+            Write-Host ''
+            Write-Host 'The domain is already federated to this Google Workspace IdP.' -ForegroundColor Green
+            Write-Host 'No change is required.' -ForegroundColor Green
+            return
+        }
+
+        if ($domain.AuthenticationType -eq 'Managed') {
+            $operation = 'Reactivate'
+            Write-Host 'A matching inactive federation object will be re-enabled.' -ForegroundColor Yellow
+        }
+        else {
+            throw "Unexpected authentication type '$($domain.AuthenticationType)'. No change has been made."
+        }
+    }
+    else {
+        if ($domain.AuthenticationType -ne 'Managed') {
+            throw "The domain is '$($domain.AuthenticationType)' but has no readable federation object. No change has been made."
+        }
+        $operation = 'Create'
+    }
+
+    Write-Host ''
+    Write-Host 'Confirm these settings in the Google Microsoft Office 365 SAML app:' -ForegroundColor Yellow
+    Write-Host '  Signed response: ENABLED'
+    Write-Host '  Name ID format: PERSISTENT'
+    Write-Host '  Name ID: Basic Information > Primary email'
+    Write-Host '  IDPEmail: Basic Information > Primary email'
+    Write-Host '  User access: ON for the intended users'
+
+    if ((Read-Host 'Type READY after checking the settings') -cne 'READY') {
+        Write-Host 'Cancelled. No Entra changes were made.' -ForegroundColor Yellow
+        return
+    }
+
+    Write-Host ''
+    Write-Host "This will redirect $DomainId Microsoft sign-ins to Google Workspace." -ForegroundColor Red
+    if ((Read-Host 'Type FEDERATE to apply the change') -cne 'FEDERATE') {
+        Write-Host 'Cancelled. No Entra changes were made.' -ForegroundColor Yellow
+        return
+    }
+
+    if ($operation -eq 'Create') {
+        $federationParameters = @{
+            DomainId = $DomainId
+            IssuerUri = $google.IssuerUri
+            DisplayName = $DisplayName
+            ActiveSignInUri = $google.SignInUri
+            PassiveSignInUri = $google.SignInUri
+            SignOutUri = $google.SignOutUri
+            SigningCertificate = $google.SigningCertificate
+            PreferredAuthenticationProtocol = 'saml'
+            FederatedIdpMfaBehavior = $FederatedIdpMfaBehavior
+        }
+
+        Write-Host 'Creating the Google federation configuration...' -ForegroundColor Cyan
+        New-MgDomainFederationConfiguration @federationParameters -ErrorAction Stop | Out-Null
+    }
+    else {
+        Write-Host 'Re-enabling the matching Google federation configuration...' -ForegroundColor Cyan
+        Update-MgDomain `
+            -DomainId $DomainId `
+            -AuthenticationType 'Federated' `
+            -ErrorAction Stop
+    }
+
+    Start-Sleep -Seconds 3
+    $updatedDomain = Get-MgDomain `
+        -DomainId $DomainId `
+        -Property Id,AuthenticationType,IsVerified `
+        -ErrorAction Stop
+    $updatedFederation = @(Get-FederationConfigurationSafely -Domain $DomainId)
+
+    if ($updatedDomain.AuthenticationType -ne 'Federated' -or $updatedFederation.Count -ne 1) {
+        throw "Verification was unexpected. Domain type: $($updatedDomain.AuthenticationType); federation count: $($updatedFederation.Count)."
+    }
+    if (
+        $updatedFederation[0].IssuerUri -ne $google.IssuerUri -or
+        $updatedFederation[0].PassiveSignInUri -ne $google.SignInUri -or
+        $updatedFederation[0].PreferredAuthenticationProtocol -ne 'saml'
+    ) {
+        throw 'The active federation values do not match the supplied Google metadata.'
+    }
+
+    Write-Host ''
+    Write-Host 'FEDERATION ENABLED AND VERIFIED' -ForegroundColor Green
+    Write-Host "Domain:   $DomainId"
+    Write-Host "Issuer:   $($updatedFederation[0].IssuerUri)"
+    Write-Host "Sign-in:  $($updatedFederation[0].PassiveSignInUri)"
+    Write-Host "Protocol: $($updatedFederation[0].PreferredAuthenticationProtocol)"
+    Write-Host ''
+    Write-Host 'Test an ordinary user in a private browser before closing the .onmicrosoft.com admin session.' -ForegroundColor Yellow
+}
+finally {
+    if ($connected) {
+        Disconnect-MgGraph | Out-Null
+    }
+}
