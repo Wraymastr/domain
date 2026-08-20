@@ -1,0 +1,143 @@
+#requires -Version 5.1
+
+<#
+.SYNOPSIS
+Returns a Microsoft Entra custom domain to Microsoft-managed authentication.
+
+.DESCRIPTION
+Emergency companion to Enable-GoogleWorkspaceEntraFederation.ps1. It changes
+only the specified custom domain's AuthenticationType to Managed. It does not
+delete the federation object, users, groups, licences, or the tenant's initial
+.onmicrosoft.com domain.
+#>
+
+[CmdletBinding()]
+param(
+    [string]$TenantId,
+    [string]$DomainId,
+    [version]$GraphVersion = [version]'2.24.0'
+)
+
+$ErrorActionPreference = 'Stop'
+
+if ([string]::IsNullOrWhiteSpace($TenantId)) {
+    $TenantId = (Read-Host 'Enter the tenant initial domain (example: school.onmicrosoft.com)').Trim()
+}
+if ([string]::IsNullOrWhiteSpace($DomainId)) {
+    $DomainId = (Read-Host 'Enter the custom domain to return to Microsoft authentication').Trim()
+}
+
+$TenantId = $TenantId.Trim().ToLowerInvariant()
+$DomainId = $DomainId.Trim().ToLowerInvariant()
+
+if ($TenantId -notmatch '^[a-z0-9][a-z0-9.-]*\.onmicrosoft\.com$') {
+    throw "TenantId must be the tenant's initial .onmicrosoft.com domain, not '$TenantId'."
+}
+if ($DomainId -notmatch '^[a-z0-9][a-z0-9.-]+\.[a-z]{2,}$' -or $DomainId.EndsWith('.onmicrosoft.com')) {
+    throw "DomainId must be a custom DNS domain, not '$DomainId'."
+}
+
+$moduleNames = @(
+    'Microsoft.Graph.Authentication'
+    'Microsoft.Graph.Identity.DirectoryManagement'
+)
+$conflictingModules = @(
+    Get-Module -Name 'Microsoft.Graph*' |
+        Where-Object Version -ne $GraphVersion
+)
+if ($conflictingModules.Count -gt 0) {
+    throw 'A different Microsoft Graph version is already loaded. Close PowerShell, open a fresh Windows PowerShell window, and retry.'
+}
+
+foreach ($moduleName in $moduleNames) {
+    $exactVersionInstalled = @(
+        Get-Module -ListAvailable -Name $moduleName |
+            Where-Object Version -eq $GraphVersion
+    ).Count -gt 0
+
+    if (-not $exactVersionInstalled) {
+        Install-Module `
+            -Name $moduleName `
+            -RequiredVersion $GraphVersion `
+            -Scope CurrentUser `
+            -Force `
+            -AllowClobber
+    }
+}
+
+Import-Module `
+    -Name 'Microsoft.Graph.Authentication' `
+    -RequiredVersion $GraphVersion `
+    -ErrorAction Stop
+Import-Module `
+    -Name 'Microsoft.Graph.Identity.DirectoryManagement' `
+    -RequiredVersion $GraphVersion `
+    -ErrorAction Stop
+
+$connected = $false
+try {
+    Write-Host ''
+    Write-Host 'Google Workspace -> Entra federation emergency rollback' -ForegroundColor Cyan
+    Write-Host "Tenant escape hatch: $TenantId"
+    Write-Host "Domain to roll back: $DomainId"
+    Write-Host "Use an administrator ending in @$TenantId." -ForegroundColor Yellow
+
+    Connect-MgGraph `
+        -TenantId $TenantId `
+        -Scopes 'Domain.ReadWrite.All','Domain-InternalFederation.ReadWrite.All' `
+        -UseDeviceCode `
+        -ContextScope Process `
+        -NoWelcome
+    $connected = $true
+
+    $context = Get-MgContext
+    Write-Host "Signed in as: $($context.Account)"
+    $expectedAdminSuffix = '@' + [regex]::Escape($TenantId) + '$'
+    if ($context.Account -notmatch $expectedAdminSuffix) {
+        throw "Wrong admin account. Sign in with an administrator ending in @$TenantId, not $($context.Account)."
+    }
+
+    $domain = Get-MgDomain `
+        -DomainId $DomainId `
+        -Property Id,AuthenticationType,IsVerified `
+        -ErrorAction Stop
+    if ($null -eq $domain) {
+        throw "Microsoft Graph returned no domain object for $DomainId."
+    }
+
+    Write-Host "Current authentication type: $($domain.AuthenticationType)"
+    if ($domain.AuthenticationType -eq 'Managed') {
+        Write-Host 'The domain is already using Microsoft-managed authentication. No change is required.' -ForegroundColor Green
+        return
+    }
+
+    Write-Host "This will stop redirecting $DomainId users to the external identity provider." -ForegroundColor Red
+    if ((Read-Host 'Type ROLLBACK to continue') -cne 'ROLLBACK') {
+        Write-Host 'Cancelled. No changes were made.' -ForegroundColor Yellow
+        return
+    }
+
+    Update-MgDomain `
+        -DomainId $DomainId `
+        -AuthenticationType 'Managed' `
+        -ErrorAction Stop
+    Start-Sleep -Seconds 3
+
+    $updatedDomain = Get-MgDomain `
+        -DomainId $DomainId `
+        -Property Id,AuthenticationType,IsVerified `
+        -ErrorAction Stop
+    if ($updatedDomain.AuthenticationType -ne 'Managed') {
+        throw "Rollback verification failed. Entra reports '$($updatedDomain.AuthenticationType)'."
+    }
+
+    Write-Host ''
+    Write-Host 'ROLLBACK COMPLETE' -ForegroundColor Green
+    Write-Host "$DomainId is now using Microsoft-managed authentication."
+    Write-Host 'The script did not intentionally delete the federation object.'
+}
+finally {
+    if ($connected) {
+        Disconnect-MgGraph | Out-Null
+    }
+}
